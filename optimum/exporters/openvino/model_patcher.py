@@ -3513,8 +3513,8 @@ def _zimage_rope_embedder_precompute_freqs_cis(dim: List[int], end: List[int], t
             timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
             freqs = torch.outer(timestep, freqs).float()
             # Store as [cos, sin] instead of complex numbers
-            cos_vals = torch.cos(freqs)
-            sin_vals = torch.sin(freqs)
+            cos_vals = torch.cos(freqs).repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
+            sin_vals = torch.sin(freqs).repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
             freqs_cis_i = torch.stack([cos_vals, sin_vals], dim=-1)  # shape: [e, d//2, 2]
             freqs_cis.append(freqs_cis_i)
 
@@ -3562,23 +3562,12 @@ def _zimage_attn_processor_call(
         with torch.amp.autocast("cuda", enabled=False):
             # x_in shape: [batch, seq_len, heads, head_dim]
             # freqs_cis shape: [batch, seq_len, head_dim//2, 2] where last dim is [cos, sin]
-            # Reshape x to separate pairs: [batch, seq_len, heads, head_dim//2, 2]
-            x_float = x_in.float().reshape(*x_in.shape[:-1], -1, 2)
-
-            # freqs_cis: [batch, seq_len, head_dim//2, 2]
-            # Need to add heads dimension: [batch, seq_len, 1, head_dim//2, 2]
-            cos = freqs_cis[..., 0].unsqueeze(-2)  # [batch, seq_len, 1, head_dim//2]
-            sin = freqs_cis[..., 1].unsqueeze(-2)  # [batch, seq_len, 1, head_dim//2]
-
-            # Rotate: [x0, x1] -> [x0*cos - x1*sin, x0*sin + x1*cos]
-            x0, x1 = x_float[..., 0], x_float[..., 1]  # Each: [batch, seq_len, heads, head_dim//2]
-            rotated_0 = x0 * cos - x1 * sin
-            rotated_1 = x0 * sin + x1 * cos
-
-            # Stack back and flatten
-            rotated = torch.stack([rotated_0, rotated_1], dim=-1)  # [batch, seq_len, heads, head_dim//2, 2]
-            x_out = rotated.flatten(-2)  # [batch, seq_len, heads, head_dim]
-            return x_out.type_as(x_in)  # todo
+            cos = freqs_cis[..., 0].unsqueeze(-2)  # [batch, seq_len, 1, head_dim]
+            sin = freqs_cis[..., 1].unsqueeze(-2)  # [batch, seq_len, 1, head_dim]
+            x_real, x_imag = x_in.float().reshape(*x_in.shape[:-1], -1, 2).unbind(-1)  # [B, H, S, D//2]
+            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+            out = (x_in.float() * cos + x_rotated.float() * sin).to(x_in.dtype)
+            return out
 
     if freqs_cis is not None:
         query = apply_rotary_emb(query, freqs_cis)
