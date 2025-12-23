@@ -1114,7 +1114,7 @@ def get_zimage_models_for_export(pipeline, exporter, int_dtype, float_dtype):
     transformer_export_config = export_config_constructor(
         pipeline.transformer.config, int_dtype=int_dtype, float_dtype=float_dtype
     )
-    transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "128.0"}
     models_for_export["transformer"] = (transformer, transformer_export_config)
 
     # VAE Decoder https://github.com/huggingface/diffusers/blob/v0.11.1/src/diffusers/models/vae.py#L600
