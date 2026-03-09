@@ -42,7 +42,7 @@ from ...exporters.openvino import main_export
 from ...exporters.openvino.stateful import model_has_state
 from .. import OVConfig
 from ..utils import is_transformers_version
-from .configuration import OVWeightQuantizationConfig
+from .configuration import OVQuantizationConfigBase, OVWeightQuantizationConfig
 from .modeling_base import OVBaseModel, OVModelPart
 from .utils import (
     ONNX_DECODER_NAME,
@@ -52,6 +52,7 @@ from .utils import (
     OV_DECODER_WITH_PAST_NAME,
     OV_ENCODER_NAME,
     TemporaryDirectory,
+    classproperty,
 )
 
 
@@ -319,6 +320,14 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
     main_input_name = "input_ids"
     export_feature = "text2text-generation"
 
+    @classproperty
+    def _all_ov_model_paths(cls) -> Dict[str, str]:
+        return {
+            "encoder": OV_ENCODER_NAME,
+            "decoder": OV_DECODER_NAME,
+            "decoder_with_past": OV_DECODER_WITH_PAST_NAME,
+        }
+
     def __init__(
         self,
         encoder: openvino.Model,
@@ -408,25 +417,6 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
     def ov_models(self) -> Dict[str, openvino.Model]:
         return {name: getattr(component, "model") for name, component in self.components.items()}
 
-    def _save_pretrained(self, save_directory: Union[str, Path]):
-        file_names = {
-            "encoder": OV_ENCODER_NAME,
-            "decoder": OV_DECODER_NAME,
-            "decoder_with_past": OV_DECODER_WITH_PAST_NAME,
-        }
-        for ov_model_name, ov_model in self.ov_models.items():
-            dst_path = os.path.join(save_directory, file_names[ov_model_name])
-            openvino.save_model(ov_model, dst_path, compress_to_fp16=False)
-
-        self._save_openvino_config(save_directory)
-        if self.generation_config is not None:
-            try:
-                self.generation_config.save_pretrained(save_directory)
-            except Exception as exception:
-                logger.warning(
-                    f"The generation config will not be saved, saving failed with following error:\n{exception}"
-                )
-
     @classmethod
     def _from_pretrained(
         cls,
@@ -450,9 +440,11 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
         generation_config = kwargs.pop("generation_config", None)
         subfolder = kwargs.pop("subfolder", "")
 
-        default_encoder_file_name = ONNX_ENCODER_NAME if from_onnx else OV_ENCODER_NAME
-        default_decoder_file_name = ONNX_DECODER_NAME if from_onnx else OV_DECODER_NAME
-        default_decoder_with_past_file_name = ONNX_DECODER_WITH_PAST_NAME if from_onnx else OV_DECODER_WITH_PAST_NAME
+        default_encoder_file_name = ONNX_ENCODER_NAME if from_onnx else cls._all_ov_model_paths["encoder"]
+        default_decoder_file_name = ONNX_DECODER_NAME if from_onnx else cls._all_ov_model_paths["decoder"]
+        default_decoder_with_past_file_name = (
+            ONNX_DECODER_WITH_PAST_NAME if from_onnx else cls._all_ov_model_paths["decoder_with_past"]
+        )
         encoder_file_name = encoder_file_name or default_encoder_file_name
         decoder_file_name = decoder_file_name or default_decoder_file_name
         decoder_with_past_file_name = decoder_with_past_file_name or default_decoder_with_past_file_name
@@ -531,7 +523,7 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
                     "Generation config file not found, using a generation config created from the model config."
                 )
 
-        quantization_config = cls._prepare_quantization_config(model_id, quantization_config, load_in_8bit)
+        quantization_config = quantization_config or (OVWeightQuantizationConfig(bits=8) if load_in_8bit else None)
         compile_model = kwargs.pop("compile", True)
         model = cls(
             encoder=encoder,
@@ -549,9 +541,15 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
         )
 
         if quantization_config:
-            cls._apply_quantization(
-                model, quantization_config, compile_only, compile_model, model_id, trust_remote_code
-            )
+            if hasattr(config, "name_or_path"):
+                model_id = config.name_or_path
+            else:
+                logger.warning(
+                    "`model_id` could not be determined from the config. In the case there are default quantization "
+                    "configurations for this model, they will not be applied."
+                )
+            quantization_config = cls._resolve_default_quantization_config(model_id, quantization_config)
+            model._apply_quantization(quantization_config, compile_only, compile_model, model_id, trust_remote_code)
 
         return model
 
@@ -811,6 +809,21 @@ class OVModelForSeq2SeqLM(OVBaseModel, GenerationMixin):
         """
         return
 
+    def _preprocess_quantization_config(
+        self,
+        quantization_config: OVQuantizationConfigBase,
+        model_name_or_path: str,
+    ) -> OVQuantizationConfigBase:
+        if model_name_or_path is not None and (
+            quantization_config.processor is None or quantization_config.tokenizer is None
+        ):
+            quantization_config = quantization_config.clone()
+            if quantization_config.processor is None:
+                quantization_config.processor = model_name_or_path
+            if quantization_config.tokenizer is None:
+                quantization_config.tokenizer = model_name_or_path
+        return quantization_config
+
 
 class OVEncoder(OVModelPart):
     def __init__(
@@ -985,7 +998,7 @@ class OVDecoder(OVModelPart):
         return Seq2SeqLMOutput(logits=logits, past_key_values=out_past_key_values)
 
     def _get_past_length(self, past_key_values=None):
-        if past_key_values is None:
+        if past_key_values is None or len(past_key_values) == 0:
             return 0
         if self.stateful:
             return self._past_length
@@ -1036,9 +1049,16 @@ class OVModelForVision2Seq(OVModelForSeq2SeqLM):
         config: PretrainedConfig = None,
         **kwargs,
     ):
-        if config.decoder.model_type == "gpt2":
+        if hasattr(config, "decoder") and getattr(config.decoder, "model_type", None) == "gpt2":
             self.no_cross_attention_cache = True
         super().__init__(encoder, decoder, decoder_with_past, config, **kwargs)
+
+    @classmethod
+    def _from_pretrained(cls, model_id: Union[str, Path], config: "PretrainedConfig", **kwargs):
+        if config.model_type == "pix2struct":
+            return OVModelForPix2Struct._from_pretrained(model_id, config, **kwargs)
+        else:
+            return super()._from_pretrained(model_id, config, **kwargs)
 
     def prepare_inputs_for_generation(
         self,
@@ -1121,10 +1141,15 @@ class OVModelForVision2Seq(OVModelForSeq2SeqLM):
     """,
     INPUTS_DOCSTRING,
 )
-class OVModelForPix2Struct(OVModelForSeq2SeqLM):
+class OVModelForPix2Struct(OVModelForVision2Seq):
     auto_model_class = Pix2StructForConditionalGeneration
     main_input_name = "flattened_patches"
     export_feature = "image-to-text"
+
+    # this is needed to avoid circular calls when OVModelForVision2Seq is called to instantiate a OVModelForPix2Struct
+    @classmethod
+    def _from_pretrained(cls, model_id: Union[str, Path], config: "PretrainedConfig", **kwargs):
+        return super(OVModelForVision2Seq, cls)._from_pretrained(model_id, config, **kwargs)
 
     def prepare_inputs_for_generation(
         self,
@@ -1175,7 +1200,7 @@ class OVModelForPix2Struct(OVModelForSeq2SeqLM):
         **kwargs,
     ) -> Seq2SeqLMOutput:
         return super().forward(
-            input_ids=flattened_patches,
+            pixel_values=flattened_patches,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,

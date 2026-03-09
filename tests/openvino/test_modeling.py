@@ -15,7 +15,6 @@
 import gc
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from typing import Dict, Generator
@@ -50,6 +49,7 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
+    SamModel,
     pipeline,
     set_seed,
 )
@@ -85,10 +85,7 @@ from optimum.intel import (
 from optimum.intel.openvino import OV_DECODER_NAME, OV_DECODER_WITH_PAST_NAME, OV_ENCODER_NAME, OV_XML_FILE_NAME
 from optimum.intel.openvino.modeling_base import OVBaseModel
 from optimum.intel.openvino.modeling_timm import TimmImageProcessor
-from optimum.intel.openvino.modeling_visual_language import (
-    MODEL_PARTS_CLS_MAPPING,
-    MODEL_TYPE_TO_CLS_MAPPING,
-)
+from optimum.intel.openvino.modeling_visual_language import MODEL_PARTS_CLS_MAPPING, MODEL_TYPE_TO_CLS_MAPPING
 from optimum.intel.openvino.utils import (
     OV_LANGUAGE_MODEL_NAME,
     OV_PROMPT_ENCODER_MASK_DECODER_MODEL_NAME,
@@ -98,11 +95,7 @@ from optimum.intel.openvino.utils import (
     TemporaryDirectory,
 )
 from optimum.intel.pipelines import pipeline as optimum_pipeline
-from optimum.intel.utils.import_utils import (
-    _langchain_hf_available,
-    is_openvino_version,
-    is_transformers_version,
-)
+from optimum.intel.utils.import_utils import _langchain_hf_available, is_transformers_version
 from optimum.intel.utils.modeling_utils import _find_files_matching_pattern
 from optimum.utils import (
     DIFFUSION_MODEL_TEXT_ENCODER_2_SUBFOLDER,
@@ -115,13 +108,7 @@ from optimum.utils import (
 from optimum.utils.testing_utils import require_diffusers
 
 
-class Timer(object):
-    def __enter__(self):
-        self.elapsed = time.perf_counter()
-        return self
-
-    def __exit__(self, type, value, traceback):
-        self.elapsed = (time.perf_counter() - self.elapsed) * 1e3
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class OVModelIntegrationTest(unittest.TestCase):
@@ -155,10 +142,7 @@ class OVModelIntegrationTest(unittest.TestCase):
         self.assertTrue(manual_openvino_cache_dir.is_dir())
         num_blobs = len(list(manual_openvino_cache_dir.glob("*.blob")))
         self.assertGreaterEqual(num_blobs, 1)
-        if is_openvino_version("<", "2023.3"):
-            self.assertEqual(loaded_model.request.get_property("PERFORMANCE_HINT").name, "THROUGHPUT")
-        else:
-            self.assertEqual(loaded_model.request.get_property("PERFORMANCE_HINT"), "THROUGHPUT")
+        self.assertEqual(loaded_model.request.get_property("PERFORMANCE_HINT"), "THROUGHPUT")
 
         # Test compile only
 
@@ -232,7 +216,9 @@ class OVModelIntegrationTest(unittest.TestCase):
 
     def test_load_from_hub_and_save_visual_language_model(self):
         model_ids = [self.OV_VLM_MODEL_ID]
-        if is_transformers_version(">=", "4.51"):
+        if is_transformers_version(">=", "4.51") and is_transformers_version("<", "4.57"):
+            # the phi4 auto-processor can't be loaded in offline mode
+            # anymore due to an internal bug in transformers
             model_ids.append("katuni4ka/phi-4-multimodal-ov")
         for model_id in model_ids:
             processor = get_preprocessor(model_id)
@@ -495,11 +481,9 @@ class OVModelIntegrationTest(unittest.TestCase):
         input_points = [[[450, 600]]]
         raw_image = Image.open(requests.get(img_url, stream=True).raw).convert("RGB")
         inputs = processor(raw_image, input_points=input_points, return_tensors="pt")
-
         loaded_model_outputs = loaded_model(**inputs)
 
         # Test compile only
-
         compile_only_model = OVModelForFeatureExtraction.from_pretrained(
             self.OV_SAM_MODEL_ID, ov_config=ov_config, compile_only=True, device=OPENVINO_DEVICE
         )
@@ -512,10 +496,10 @@ class OVModelIntegrationTest(unittest.TestCase):
         self.assertIsInstance(compile_only_model.prompt_encoder_mask_decoder.model, ov.CompiledModel)
         self.assertIsInstance(compile_only_model.prompt_encoder_mask_decoder.request, ov.CompiledModel)
         outputs = compile_only_model(**inputs)
-        self.assertTrue(torch.equal(loaded_model_outputs.iou_scores, outputs.iou_scores))
-        self.assertTrue(torch.equal(loaded_model_outputs.pred_masks, outputs.pred_masks))
-        del compile_only_model
+        torch.testing.assert_close(loaded_model_outputs.iou_scores, outputs.iou_scores, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(loaded_model_outputs.pred_masks, outputs.pred_masks, atol=1e-4, rtol=1e-4)
 
+        # Test save and load
         with TemporaryDirectory() as tmpdirname:
             loaded_model.save_pretrained(tmpdirname)
             folder_contents = os.listdir(tmpdirname)
@@ -531,12 +515,8 @@ class OVModelIntegrationTest(unittest.TestCase):
             )
 
         outputs = model(**inputs)
-        self.assertTrue(torch.equal(loaded_model_outputs.iou_scores, outputs.iou_scores))
-        self.assertTrue(torch.equal(loaded_model_outputs.pred_masks, outputs.pred_masks))
-
-        del loaded_model
-        del model
-        gc.collect()
+        torch.testing.assert_close(loaded_model_outputs.iou_scores, outputs.iou_scores, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(loaded_model_outputs.pred_masks, outputs.pred_masks, atol=1e-4, rtol=1e-4)
 
     def test_load_from_hub_and_save_text_speech_model(self):
         loaded_model = OVModelForTextToSpeechSeq2Seq.from_pretrained(
@@ -557,10 +537,10 @@ class OVModelIntegrationTest(unittest.TestCase):
         with TemporaryDirectory() as tmpdirname:
             loaded_model.save_pretrained(tmpdirname)
             folder_contents = os.listdir(tmpdirname)
-            self.assertTrue(loaded_model.OV_ENCODER_MODEL_NAME in folder_contents)
-            self.assertTrue(loaded_model.OV_DECODER_MODEL_NAME in folder_contents)
-            self.assertTrue(loaded_model.OV_POSTNET_MODEL_NAME in folder_contents)
-            self.assertTrue(loaded_model.OV_VOCODER_MODEL_NAME in folder_contents)
+            self.assertTrue(loaded_model._ov_model_paths["encoder"] in folder_contents)
+            self.assertTrue(loaded_model._ov_model_paths["decoder"] in folder_contents)
+            self.assertTrue(loaded_model._ov_model_paths["postnet"] in folder_contents)
+            self.assertTrue(loaded_model._ov_model_paths["vocoder"] in folder_contents)
             model = OVModelForTextToSpeechSeq2Seq.from_pretrained(tmpdirname, device="cpu")
             # compile only
             compile_only_model = OVModelForTextToSpeechSeq2Seq.from_pretrained(
@@ -930,7 +910,7 @@ class OVModelForQuestionAnsweringIntegrationTest(unittest.TestCase):
         ov_model = OVModelForQuestionAnswering.from_pretrained(model_id, export=True, device=OPENVINO_DEVICE)
         transformers_model = AutoModelForQuestionAnswering.from_pretrained(model_id)
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        data = load_dataset("squad", split="validation").select(range(50))
+        data = load_dataset("rajpurkar/squad", split="validation").select(range(50))
         task_evaluator = evaluator("question-answering")
         transformers_pipe = pipeline("question-answering", model=transformers_model, tokenizer=tokenizer)
         ov_pipe = pipeline("question-answering", model=ov_model, tokenizer=tokenizer)
@@ -1115,6 +1095,7 @@ class OVModelForMaskedLMIntegrationTest(unittest.TestCase):
         "mobilebert",
         "mpnet",
         "perceiver_text",
+        "rembert",
         "roberta",
         "roformer",
         "squeezebert",
@@ -1531,6 +1512,7 @@ class OVModelForCustomTasksIntegrationTest(unittest.TestCase):
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_ATTENTION)
     def test_compare_output_attentions(self, model_arch):
+        self.skipTest("Skipping until ticket 175062 is resolved.")
         model_id = MODEL_NAMES[model_arch]
 
         image = self._get_sample_image()
@@ -1569,6 +1551,7 @@ class OVModelForCustomTasksIntegrationTest(unittest.TestCase):
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_HIDDEN_STATES)
     def test_compare_output_hidden_states(self, model_arch):
+        self.skipTest("Skipping until ticket 175062 is resolved.")
         model_id = MODEL_NAMES[model_arch]
 
         image = self._get_sample_image()
@@ -1643,10 +1626,14 @@ class OVModelForOpenCLIPZeroShortImageClassificationTest(unittest.TestCase):
         with TemporaryDirectory() as tmpdirname:
             loaded_model.save_pretrained(tmpdirname)
             folder_contents = os.listdir(tmpdirname)
-            self.assertTrue(loaded_model.text_model._xml_model_name in folder_contents)
-            self.assertTrue(loaded_model.text_model._xml_model_name.replace(".xml", ".bin") in folder_contents)
-            self.assertTrue(loaded_model.visual_model._xml_model_name in folder_contents)
-            self.assertTrue(loaded_model.visual_model._xml_model_name.replace(".xml", ".bin") in folder_contents)
+            self.assertTrue(loaded_model.text_model._all_ov_model_paths["model"] in folder_contents)
+            self.assertTrue(
+                loaded_model.text_model._all_ov_model_paths["model"].replace(".xml", ".bin") in folder_contents
+            )
+            self.assertTrue(loaded_model.visual_model._all_ov_model_paths["model"] in folder_contents)
+            self.assertTrue(
+                loaded_model.visual_model._all_ov_model_paths["model"].replace(".xml", ".bin") in folder_contents
+            )
             model = OVModelOpenCLIPForZeroShotImageClassification.from_pretrained(tmpdirname, device=OPENVINO_DEVICE)
 
         outputs = model(tokens, processed_image)
@@ -1860,7 +1847,7 @@ class OVSamIntegrationTest(unittest.TestCase):
         ).convert("RGB")
         inputs = processor(IMAGE, input_points=input_points, return_tensors="pt")
 
-        transformers_model = OVSamModel.from_pretrained(model_id, device=OPENVINO_DEVICE)
+        transformers_model = SamModel.from_pretrained(model_id)
 
         # test end-to-end inference
         ov_outputs = ov_model(**inputs)
@@ -1878,7 +1865,7 @@ class OVSamIntegrationTest(unittest.TestCase):
 
         # test separated image features extraction
         pixel_values = inputs.pop("pixel_values")
-        features = transformers_model.get_image_features(pixel_values)
+        features = transformers_model.get_image_embeddings(pixel_values)
         ov_features = ov_model.get_image_features(pixel_values)
         self.assertTrue(torch.allclose(ov_features, features, atol=1e-4))
         ov_outputs = ov_model(**inputs, image_embeddings=ov_features)

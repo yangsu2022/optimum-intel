@@ -30,6 +30,7 @@ jobs:
       matrix:
         test-pattern:
           [
+            "*genai*",
             "*export*",
             "*decoder*",
             "*seq2seq*",
@@ -53,7 +54,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip uv
-          uv pip install .[openvino,diffusers,tests]
+          uv pip install .[diffusers,tests]
 
       - if: ${{ matrix.transformers-version != 'latest' }}
         name: Install specific dependencies and versions required for older transformers

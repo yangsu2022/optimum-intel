@@ -151,26 +151,37 @@ _HEAD_TO_AUTOMODELS = {
     "z-image": "OVZImagePipeline"
 }
 
-PREDEFINED_CAUSAL_LANGUAGE_DATASETS = {"wikitext2", "c4", "c4-new", "auto"}
+PREDEFINED_CAUSAL_LANGUAGE_DATASETS = {"wikitext2", "c4", "c4-new", "auto", "gsm8k"}
 
 PREDEFINED_LANGUAGE_DATASETS = {
-    "wikitext2": {"id": "wikitext", "name": "wikitext-2-raw-v1", "split": "train", "streaming": False},
+    "wikitext2": {"id": "Salesforce/wikitext", "name": "wikitext-2-raw-v1", "split": "train", "streaming": False},
     "c4": {"id": "allenai/c4", "name": "en", "split": "train", "streaming": True},
 }
 
 PREDEFINED_SD_DATASETS = {
-    "conceptual_captions": {"split": "train", "prompt_column_name": "caption", "streaming": True},
-    "laion/220k-GPT4Vision-captions-from-LIVIS": {
+    "conceptual_captions": {
+        "id": "google-research-datasets/conceptual_captions",
         "split": "train",
         "prompt_column_name": "caption",
         "streaming": True,
     },
-    "laion/filtered-wit": {"split": "train", "prompt_column_name": "caption", "streaming": True},
+    "laion/220k-GPT4Vision-captions-from-LIVIS": {
+        "id": "laion/220k-GPT4Vision-captions-from-LIVIS",
+        "split": "train",
+        "prompt_column_name": "caption",
+        "streaming": True,
+    },
+    "laion/filtered-wit": {
+        "id": "laion/filtered-wit",
+        "split": "train",
+        "prompt_column_name": "caption",
+        "streaming": True,
+    },
 }
 
 PREDEFINED_TEXT_IMAGE_ENCODER_DATASETS = {
     "conceptual_captions": {
-        "id": "conceptual_captions",
+        "id": "google-research-datasets/conceptual_captions",
         "split": "train",
         "text_column_name": "caption",
         "image_column_name": "image_url",
@@ -207,6 +218,11 @@ PREDEFINED_SAM_DATASETS = {
 
 
 NEED_CONVERT_TO_FAST_TOKENIZER: Tuple[Type[PreTrainedTokenizer]] = (CLIPTokenizer, Qwen2Tokenizer)
+
+
+class classproperty(property):
+    def __get__(self, instance, owner=None):
+        return self.fget(owner)
 
 
 def maybe_convert_tokenizer_to_fast(
