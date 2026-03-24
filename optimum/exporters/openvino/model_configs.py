@@ -267,6 +267,18 @@ def init_model_configs():
         "transformers",
         "AutoModelForImageTextToText",
     )
+    TasksManager._CUSTOM_CLASSES[("pt", "qwen3_5_moe", "image-text-to-text")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
+    TasksManager._CUSTOM_CLASSES[("pt", "qwen3_5_moe", "text-generation")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
+    TasksManager._CUSTOM_CLASSES[("pt", "qwen3_5_moe", "text-generation-with-past")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
 
     # since transformers v4.46, model can be loaded using default AutoModelForImageTextToText
     # https://github.com/huggingface/transformers/blob/v4.46.0/src/transformers/models/auto/modeling_auto.py#L776
@@ -5756,3 +5768,62 @@ class Qwen3_5OpenVINOConfig(Qwen3VLOpenVINOConfig):
                 "qwen3_5_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
             ).outputs
         raise Exception("Unknown Qwen3.5 behavior type.")
+
+
+@register_in_tasks_manager(
+    "qwen3_5_moe_text",
+    *["text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class Qwen3_5MoeTextOpenVINOConfig(Qwen3_5TextOpenVINOConfig):
+    pass
+
+
+@register_in_tasks_manager(
+    "qwen3_5_moe",
+    *["image-text-to-text", "text-generation", "text-generation-with-past"],
+    library_name="transformers",
+)
+class Qwen3_5MoeOpenVINOConfig(Qwen3_5OpenVINOConfig):
+    def with_behavior(
+        self,
+        behavior: Union[str, QwenVLConfigBehavior],
+    ):
+        if isinstance(behavior, str) and not isinstance(behavior, QwenVLConfigBehavior):
+            behavior = QwenVLConfigBehavior(behavior)
+
+        if behavior == QwenVLConfigBehavior.TEXT_EMBEDDINGS:
+            return get_vlm_text_embeddings_config(
+                "qwen3_5_moe_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            )
+
+        if behavior == QwenVLConfigBehavior.LANGUAGE:
+            return get_vlm_text_generation_config(
+                "qwen3_5_moe_text",
+                self._orig_config.text_config,
+                self.int_dtype,
+                self.float_dtype,
+                model_patcher=Qwen3_5ModelPatcher,
+            )
+
+        if behavior in (
+            QwenVLConfigBehavior.VISION_EMBEDDINGS,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_MERGER,
+            QwenVLConfigBehavior.VISION_EMBEDDINGS_POS,
+        ):
+            return self.__class__(
+                self._orig_config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        if self._behavior == QwenVLConfigBehavior.LANGUAGE:
+            return get_vlm_internal_text_generation_config(
+                "qwen3_5_moe_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
+            ).outputs
+        return super().outputs

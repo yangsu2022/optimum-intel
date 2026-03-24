@@ -536,7 +536,7 @@ def main_export(
         )
 
         # Allow exporting VLM models as text-only LLM
-        _VLM_TO_TEXT_TYPE = {"qwen3_5": "qwen3_5_text"}
+        _VLM_TO_TEXT_TYPE = {"qwen3_5": "qwen3_5_text", "qwen3_5_moe": "qwen3_5_moe_text"}
         if model_type in _VLM_TO_TEXT_TYPE and task.startswith("text-generation"):
             model.config = model.config.text_config
             model.config.export_model_type = _VLM_TO_TEXT_TYPE[model_type]
