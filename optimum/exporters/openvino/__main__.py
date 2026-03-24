@@ -391,7 +391,7 @@ def main_export(
                 task.startswith("text-generation")
                 or getattr(config, "model_type", "") in MULTI_MODAL_TEXT_GENERATION_MODELS
             )
-            and getattr(config, "torch_dtype", torch.float32) in [torch.float16, torch.bfloat16]
+            and (getattr(config, "torch_dtype", None) or torch.float32) in [torch.float16, torch.bfloat16]
         ):
             if ov_config is not None and ov_config.dtype in {"fp16", "fp32"}:
                 dtype = torch.float16 if ov_config.dtype == "fp16" else torch.float32
@@ -496,6 +496,13 @@ def main_export(
                 **loading_kwargs,
             )
 
+        # Fallback: detect actual model parameter dtype if patch_16bit was not set
+        if not patch_16bit and framework == "pt":
+            for param in model.parameters():
+                if param.dtype in (torch.float16, torch.bfloat16):
+                    patch_16bit = True
+                    break
+
         needs_pad_token_id = task == "text-classification" and getattr(model.config, "pad_token_id", None) is None
 
         if needs_pad_token_id:
@@ -527,6 +534,12 @@ def main_export(
         preprocessors = load_preprocessors(
             model_name_or_path, subfolder=subfolder, trust_remote_code=trust_remote_code, model_type=model_type
         )
+
+        # Allow exporting VLM models as text-only LLM
+        _VLM_TO_TEXT_TYPE = {"qwen3_5": "qwen3_5_text"}
+        if model_type in _VLM_TO_TEXT_TYPE and task.startswith("text-generation"):
+            model.config = model.config.text_config
+            model.config.export_model_type = _VLM_TO_TEXT_TYPE[model_type]
 
         submodel_paths = export_from_model(
             model=model,

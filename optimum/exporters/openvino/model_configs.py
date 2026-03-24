@@ -259,6 +259,14 @@ def init_model_configs():
         "transformers",
         "AutoModelForImageTextToText",
     )
+    TasksManager._CUSTOM_CLASSES[("pt", "qwen3_5", "text-generation")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
+    TasksManager._CUSTOM_CLASSES[("pt", "qwen3_5", "text-generation-with-past")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
 
     # since transformers v4.46, model can be loaded using default AutoModelForImageTextToText
     # https://github.com/huggingface/transformers/blob/v4.46.0/src/transformers/models/auto/modeling_auto.py#L776
@@ -5641,7 +5649,7 @@ class Qwen3_5TextOpenVINOConfig(Qwen3VLTextOpenVINOConfig):
 
 @register_in_tasks_manager(
     "qwen3_5",
-    *["image-text-to-text"],
+    *["image-text-to-text", "text-generation", "text-generation-with-past"],
     library_name="transformers",
 )
 class Qwen3_5OpenVINOConfig(Qwen3VLOpenVINOConfig):

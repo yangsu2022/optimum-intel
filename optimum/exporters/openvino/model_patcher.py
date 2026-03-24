@@ -8539,7 +8539,7 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
         self._is_vlm = hasattr(self._model.model, "language_model")
         if self._is_vlm:
             self._text_model = self._model.model.language_model
-            self._text_config = self._model.config.text_config
+            self._text_config = getattr(self._model.config, "text_config", self._model.config)
         else:
             self._text_model = self._model.model
             self._text_config = self._model.model.config
@@ -8634,13 +8634,23 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
 
             if self._is_vlm:
                 # VLM case: call language model through the composite model
-                outputs_lm = self._text_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=wrapped_cache_params,
-                    use_cache=use_cache,
-                )
+                # Support text-only export (input_ids provided) and VLM export (inputs_embeds provided)
+                if input_ids is not None and inputs_embeds is None:
+                    outputs_lm = self._text_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=wrapped_cache_params,
+                        use_cache=use_cache,
+                    )
+                else:
+                    outputs_lm = self._text_model(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=wrapped_cache_params,
+                        use_cache=use_cache,
+                    )
                 hidden_states = outputs_lm[0]
                 logits = self._model.lm_head(hidden_states)
                 past_kv = outputs_lm.past_key_values
