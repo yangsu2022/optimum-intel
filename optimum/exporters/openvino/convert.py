@@ -380,6 +380,19 @@ def export_pytorch(
 
         dummy_inputs = config.rename_ambiguous_inputs(dummy_inputs)
         dummy_inputs, dict_inputs = remove_none_from_dummy_inputs(dummy_inputs)
+
+        # Clean up any lingering __make_16bit_traceable patches from previous submodel exports.
+        # patch_model() adds __wrapped__ to forward methods; if it leaks into the next submodel (e.g.
+        # nn.Embedding), ModelPatcher's traceable_check_model_inputs branch double-binds the method
+        # via types.MethodType and inspect.signature() returns an empty parameter set, causing
+        # "Config dummy inputs are not a subset of the model inputs" errors.
+        _PATCH_ATTR = "_openvino_module_extension_patch_orig_forward"
+        for submod in model.modules():
+            orig = getattr(submod, _PATCH_ATTR, None)
+            if orig is not None:
+                submod.forward = orig
+                delattr(submod, _PATCH_ATTR)
+
         # TorchScript used behind OpenVINO conversion. Optimum supports only return_dict=True models for patching,
         # while TorchScript do not support dictionary with values of mixed types (e.g. Tensor and None) in model input/output
         # To handle it, additional wrapper on patcher forward applied.

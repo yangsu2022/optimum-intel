@@ -209,7 +209,10 @@ class OVBaseDecoderModel(OVModel, PushToHubMixin):
 
     @staticmethod
     def _has_cache_inputs(model: openvino.Model) -> bool:
-        return any("past_key_values" in key.get_any_name() for key in model.inputs)
+        return any(
+            "past_key_values" in key.get_any_name() or "cache_params" in key.get_any_name()
+            for key in model.inputs
+        )
 
     @staticmethod
     def _get_model_with_updated_pkv_precision(model: openvino.Model, pkv_precision: Type) -> openvino.Model:
