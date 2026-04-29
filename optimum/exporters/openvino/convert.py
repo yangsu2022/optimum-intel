@@ -1152,6 +1152,22 @@ def get_zimage_models_for_export(pipeline, exporter, int_dtype, float_dtype):
     transformer_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "128.0"}
     models_for_export["transformer"] = (transformer, transformer_export_config)
 
+    # VAE Encoder
+    vae_encoder = copy.deepcopy(pipeline.vae)
+    vae_encoder.forward = lambda sample: {"latent_sample": vae_encoder.encode(x=sample)["latent_dist"].mode()}
+    vae_config_constructor = TasksManager.get_exporter_config_constructor(
+        model=vae_encoder,
+        exporter=exporter,
+        library_name="diffusers",
+        task="semantic-segmentation",
+        model_type="dcae-encoder",
+    )
+    vae_encoder_export_config = vae_config_constructor(
+        vae_encoder.config, int_dtype=int_dtype, float_dtype=float_dtype
+    )
+    vae_encoder_export_config.runtime_options = {"ACTIVATIONS_SCALE_FACTOR": "8.0"}
+    models_for_export["vae_encoder"] = (vae_encoder, vae_encoder_export_config)
+
     # VAE Decoder https://github.com/huggingface/diffusers/blob/v0.11.1/src/diffusers/models/vae.py#L600
     vae_decoder = copy.deepcopy(pipeline.vae)
     vae_decoder.forward = lambda latent_sample: vae_decoder.decode(z=latent_sample)

@@ -1240,6 +1240,17 @@ class OVModelUnet(OVPipelinePart):
         if added_cond_kwargs is not None:
             model_inputs.update(added_cond_kwargs)
 
+        if os.environ.get("ZIMAGE_DEBUG_INPUTS", "0") == "1":
+            debug_items = []
+            for name, value in model_inputs.items():
+                if isinstance(value, torch.Tensor):
+                    debug_items.append(
+                        f"{name}:shape={tuple(value.shape)} dtype={value.dtype} numel={value.numel()}"
+                    )
+                else:
+                    debug_items.append(f"{name}:type={type(value)}")
+            print(f"[zimage-debug] transformer inputs -> {' | '.join(debug_items)}", flush=True)
+
         ov_outputs = self.request(model_inputs, share_inputs=True).to_dict()
 
         model_outputs = {}
@@ -1271,9 +1282,13 @@ class OVModelTransformer(OVPipelinePart):
         rope_interpolation_scale: Optional[Union[Tuple[float, float, float], torch.Tensor]] = None,
         video_coords: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        control_context: Optional[torch.Tensor] = None,
+        control_context_scale: Optional[Union[float, torch.Tensor]] = None,
         return_dict: bool = True,
     ):
         self.compile()
+
+        input_names = {inp.get_any_name() for inp in self.model.inputs}
                 
         # Convert list inputs to tensors if needed
         if isinstance(hidden_states, list):
@@ -1284,12 +1299,32 @@ class OVModelTransformer(OVPipelinePart):
             timestep = encoder_hidden_states
             encoder_hidden_states = torch.stack(pooled_projections)
             pooled_projections = None
+        elif timestep is None and pooled_projections is not None and encoder_hidden_states is not None:
+            # Z-Image positional call path: (hidden_states, timestep, prompt_embeds)
+            # lands here as encoder_hidden_states=timestep, pooled_projections=prompt_embeds.
+            timestep = encoder_hidden_states
+            encoder_hidden_states = pooled_projections
+            pooled_projections = None
+
+            if isinstance(encoder_hidden_states, list):
+                encoder_hidden_states = torch.stack(encoder_hidden_states)
         
         model_inputs = {
             "hidden_states": hidden_states,
             "timestep": timestep,
             "encoder_hidden_states": encoder_hidden_states,
         }
+        model_inputs = {k: v for k, v in model_inputs.items() if v is not None}
+
+        # Keep backward compatibility for models that use legacy input names.
+        if "hidden_states" not in input_names and "x" in input_names:
+            model_inputs["x"] = model_inputs.pop("hidden_states")
+        elif "hidden_states" not in input_names and "hidden_states.1" in input_names:
+            model_inputs["hidden_states.1"] = model_inputs.pop("hidden_states")
+        if "timestep" not in input_names and "t" in input_names:
+            model_inputs["t"] = model_inputs.pop("timestep")
+        if "encoder_hidden_states" not in input_names and "cap_feats" in input_names:
+            model_inputs["cap_feats"] = model_inputs.pop("encoder_hidden_states")
 
         if pooled_projections is not None:
             model_inputs["pooled_projections"] = pooled_projections
@@ -1299,6 +1334,45 @@ class OVModelTransformer(OVPipelinePart):
             model_inputs["txt_ids"] = txt_ids
         if guidance is not None:
             model_inputs["guidance"] = guidance
+
+        auto_zero_hints = False
+        if block_controlnet_hidden_states is not None:
+            if "block_controlnet_hidden_states" in input_names:
+                model_inputs["block_controlnet_hidden_states"] = block_controlnet_hidden_states
+            elif "hints" in input_names:
+                model_inputs["hints"] = block_controlnet_hidden_states
+        elif "hints" in input_names:
+            # Compatibility path for base generation with a transformer IR that requires hints.
+            # Build zero hints with shape [3, B, S, D], where S matches unified token length
+            # (image tokens + text tokens) used by the transformer blocks.
+            hs_name = "hidden_states.1" if "hidden_states.1" in model_inputs else "hidden_states"
+            hs = model_inputs.get(hs_name)
+            if isinstance(hs, torch.Tensor) and hs.ndim == 5:
+                bsz = hs.shape[0]
+                image_seq_len = (hs.shape[-2] // 2) * (hs.shape[-1] // 2)
+                text_seq_len = 0
+                eh = model_inputs.get("encoder_hidden_states")
+                if isinstance(eh, torch.Tensor) and eh.ndim == 3:
+                    text_seq_len = int(eh.shape[1])
+                seq_len = image_seq_len + text_seq_len
+                hidden_dim = 3840
+                if isinstance(eh, torch.Tensor) and eh.ndim == 3:
+                    # Z-Image usually uses 2560 text dim and 3840 transformer dim.
+                    # Keep 3840 as default but avoid accidental zero/invalid shapes.
+                    hidden_dim = max(3840, int(eh.shape[-1]))
+                model_inputs["hints"] = torch.zeros(
+                    (3, bsz, seq_len, hidden_dim), dtype=hs.dtype, device=hs.device
+                )
+                auto_zero_hints = True
+
+        if control_context is not None and "control_context" in input_names:
+            model_inputs["control_context"] = control_context
+        if control_context_scale is not None and "control_context_scale" in input_names:
+            if not isinstance(control_context_scale, torch.Tensor):
+                control_context_scale = torch.tensor([control_context_scale], dtype=torch.float32)
+            model_inputs["control_context_scale"] = control_context_scale
+        elif "control_context_scale" in input_names:
+            model_inputs["control_context_scale"] = torch.tensor([0.0], dtype=torch.float32)
 
         if encoder_attention_mask is not None:
             model_inputs["encoder_attention_mask"] = encoder_attention_mask
@@ -1312,15 +1386,54 @@ class OVModelTransformer(OVPipelinePart):
             if not isinstance(rope_interpolation_scale, torch.Tensor):
                 rope_interpolation_scale = torch.tensor(rope_interpolation_scale)
             model_inputs["rope_interpolation_scale"] = rope_interpolation_scale
-        
-        
-        ov_outputs = self.request(model_inputs, share_inputs=True).to_dict()
+
+        if os.environ.get("ZIMAGE_DEBUG_INPUTS", "0") == "1":
+            debug_items = []
+            for name, value in model_inputs.items():
+                if isinstance(value, torch.Tensor):
+                    debug_items.append(
+                        f"{name}:shape={tuple(value.shape)} dtype={value.dtype} numel={value.numel()}"
+                    )
+                else:
+                    debug_items.append(f"{name}:type={type(value)}")
+            print(f"[zimage-debug] transformer inputs -> {' | '.join(debug_items)}", flush=True)
+
+        try:
+            ov_outputs = self.request(model_inputs, share_inputs=True).to_dict()
+        except RuntimeError as ex:
+            # Some exported IRs may interpret hints layout as [B, N, S, D] instead of [N, B, S, D].
+            # Retry once with swapped first two dims for auto-generated zero hints.
+            if (
+                auto_zero_hints
+                and "hints" in model_inputs
+                and isinstance(model_inputs["hints"], torch.Tensor)
+                and model_inputs["hints"].ndim == 4
+            ):
+                hints = model_inputs["hints"]
+                model_inputs["hints"] = hints.permute(1, 0, 2, 3).contiguous()
+                if os.environ.get("ZIMAGE_DEBUG_INPUTS", "0") == "1":
+                    print(
+                        f"[zimage-debug] retry with permuted hints layout -> {tuple(model_inputs['hints'].shape)}",
+                        flush=True,
+                    )
+                ov_outputs = self.request(model_inputs, share_inputs=True).to_dict()
+            else:
+                raise ex
 
         model_outputs = {}
-        for key, value in ov_outputs.items():
-            model_outputs[next(iter(key.names))] = torch.from_numpy(value)
-            if "unified_results" in model_outputs:
-                model_outputs["unified_results"] = [model_outputs["unified_results"]]
+        for idx, (key, value) in enumerate(ov_outputs.items()):
+            output_name = None
+            if hasattr(key, "names") and len(key.names) > 0:
+                output_name = next(iter(key.names))
+            else:
+                try:
+                    output_name = key.get_any_name()
+                except Exception:
+                    output_name = f"output_{idx}"
+            model_outputs[output_name] = torch.from_numpy(value)
+
+        if "unified_results" in model_outputs:
+            model_outputs["unified_results"] = [model_outputs["unified_results"]]
 
         if return_dict:
             return model_outputs
