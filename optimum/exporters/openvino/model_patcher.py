@@ -3837,16 +3837,13 @@ def _zimage_control_forward(
         cap_inner_pad_mask,
     ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
-    # Patchify control context (reuse patchify logic)
+    # Patchify control context exactly like VideoX-Fun control path.
     (
         ctrl_ctx,
-        _,  # cap_feats already processed
-        _,  # ctrl_size same as x_size
+        _,
         ctrl_pos_ids,
-        _,  # cap_pos_ids already processed
         ctrl_inner_pad_mask,
-        _,  # cap_inner_pad_mask already processed
-    ) = self.patchify_and_embed(control_ctx, cap_feats, patch_size, f_patch_size)
+    ) = self.patchify(control_ctx, patch_size, f_patch_size, cap_feats[0].size(0))
 
     # x embed & refine
     x_item_seqlens = [_.shape[0] for _ in x]
@@ -3889,14 +3886,26 @@ def _zimage_control_forward(
 
     # Process control noise refiner to get refiner hints
     refiner_hints = None
+    control_context_for_layers = ctrl_ctx
+    control_context_item_seqlens = ctrl_item_seqlens
     if hasattr(self, 'add_control_noise_refiner') and self.add_control_noise_refiner:
+        # Match VideoX-Fun's 2.0 flow: select refiner layers based on
+        # add_control_noise_refiner_correctly.
+        local_layers = self.control_noise_refiner if self.add_control_noise_refiner_correctly else self.control_layers
         c = ctrl_ctx
-        for idx, layer in enumerate(self.control_noise_refiner):
+        for idx, layer in enumerate(local_layers):
             if idx == 0:
-                # First block: before_proj(c) + x
                 refiner_hints, c = layer(c, x, ctrl_attn_mask, ctrl_freqs_cis, adaln_input, None)
             else:
                 refiner_hints, c = layer(c, x, ctrl_attn_mask, ctrl_freqs_cis, adaln_input, refiner_hints)
+        control_context_for_layers = c
+    else:
+        # Match VideoX-Fun's 1.0 flow: run control_noise_refiner on
+        # control context before control_layers.
+        c = ctrl_ctx
+        for layer in self.control_noise_refiner:
+            c = layer(c, ctrl_attn_mask, ctrl_freqs_cis, adaln_input)
+        control_context_for_layers = c
     
     # Noise refiner with optional hint injection
     for layer in self.noise_refiner:
@@ -3946,9 +3955,9 @@ def _zimage_control_forward(
     # Unified control context + cap
     ctrl_unified = []
     for i in range(bsz):
-        ctrl_len = ctrl_item_seqlens[i]
+        ctrl_len = control_context_item_seqlens[i]
         cap_len = cap_item_seqlens[i]
-        ctrl_unified.append(torch.cat([ctrl_ctx[i][:ctrl_len], cap_feats[i][:cap_len]]))
+        ctrl_unified.append(torch.cat([control_context_for_layers[i][:ctrl_len], cap_feats[i][:cap_len]]))
     ctrl_unified = pad_sequence(ctrl_unified, batch_first=True, padding_value=0.0)
 
     # Process control layers to get hints

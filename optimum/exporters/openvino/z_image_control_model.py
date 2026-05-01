@@ -13,10 +13,6 @@ import torch.nn as nn
 from diffusers.models.transformers.transformer_z_image import (
     ZImageTransformer2DModel,
     ZImageTransformerBlock,
-    RMSNorm,
-    FinalLayer,
-    RopeEmbedder,
-    ADALN_EMBED_DIM,
 )
 from diffusers.configuration_utils import register_to_config
 
@@ -24,7 +20,7 @@ from diffusers.configuration_utils import register_to_config
 SEQ_MULTI_OF = 32
 
 
-class OVZImageControlTransformerBlock(nn.Module):
+class OVZImageControlTransformerBlock(ZImageTransformerBlock):
     """
     OV-friendly version of ZImageControlTransformerBlock.
     
@@ -44,41 +40,8 @@ class OVZImageControlTransformerBlock(nn.Module):
         modulation: bool = True,
         block_id: int = 0
     ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.dim = dim
+        super().__init__(layer_id, dim, n_heads, n_kv_heads, norm_eps, qk_norm, modulation)
         self.block_id = block_id
-        self.modulation = modulation
-        
-        # Create the base transformer block components
-        # Attention
-        from diffusers.models.attention_processor import Attention
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.attention = Attention(
-            query_dim=dim,
-            heads=n_heads,
-            kv_heads=n_kv_heads,
-            dim_head=dim // n_heads,
-            bias=False,
-            out_bias=True,
-            qk_norm="rms_norm" if qk_norm else None,
-        )
-        
-        # FFN
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(dim, dim * 4, bias=False),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim, bias=False),
-        )
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
-        
-        # Modulation (if enabled)
-        if modulation:
-            self.adaln = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True),
-            )
         
         # Control-specific layers
         if block_id == 0:
@@ -113,28 +76,8 @@ class OVZImageControlTransformerBlock(nn.Module):
         """
         if self.block_id == 0:
             c = self.before_proj(c) + x
-            # No previous hints
-            num_prev_hints = 0
-        else:
-            # c is the last element, prev_hints contains all previous hints
-            num_prev_hints = prev_hints.shape[0] if prev_hints is not None else 0
         
-        # Apply modulation if enabled
-        if self.modulation and adaln_input is not None:
-            adaln_out = self.adaln(adaln_input)
-            shift1, scale1, shift2, scale2 = adaln_out.chunk(4, dim=-1)
-            
-            # Attention with modulation
-            c_normed = self.attention_norm1(c) * (1 + scale1.unsqueeze(1)) + shift1.unsqueeze(1)
-            c = c + self.attention(c_normed, attention_mask=attn_mask, freqs_cis=freqs_cis)
-            
-            # FFN with modulation
-            c_ffn = self.ffn_norm1(c) * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
-            c = c + self.ffn_norm2(self.feed_forward(c_ffn))
-        else:
-            # Without modulation
-            c = c + self.attention(self.attention_norm1(c), attention_mask=attn_mask, freqs_cis=freqs_cis)
-            c = c + self.ffn_norm2(self.feed_forward(self.ffn_norm1(c)))
+        c = super().forward(c, attn_mask, freqs_cis, adaln_input)
         
         # Generate hint from this block
         c_skip = self.after_proj(c)
@@ -148,7 +91,7 @@ class OVZImageControlTransformerBlock(nn.Module):
         return hints_stack, c
 
 
-class OVBaseZImageTransformerBlock(nn.Module):
+class OVBaseZImageTransformerBlock(ZImageTransformerBlock):
     """
     OV-friendly version of BaseZImageTransformerBlock.
     
@@ -166,40 +109,8 @@ class OVBaseZImageTransformerBlock(nn.Module):
         modulation: bool = True,
         block_id: Optional[int] = None,  # None means no control hint injection
     ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.dim = dim
+        super().__init__(layer_id, dim, n_heads, n_kv_heads, norm_eps, qk_norm, modulation)
         self.block_id = block_id
-        self.modulation = modulation
-        
-        # Attention
-        from diffusers.models.attention_processor import Attention
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.attention = Attention(
-            query_dim=dim,
-            heads=n_heads,
-            kv_heads=n_kv_heads,
-            dim_head=dim // n_heads,
-            bias=False,
-            out_bias=True,
-            qk_norm="rms_norm" if qk_norm else None,
-        )
-        
-        # FFN
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(dim, dim * 4, bias=False),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim, bias=False),
-        )
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
-        
-        # Modulation
-        if modulation:
-            self.adaln = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True),
-            )
     
     def forward(
         self,
@@ -218,23 +129,7 @@ class OVBaseZImageTransformerBlock(nn.Module):
             hints: [num_hints, B, S, D] - hints from control blocks
             context_scale: Scale factor for hint injection
         """
-        # Apply modulation if enabled
-        if self.modulation and adaln_input is not None:
-            adaln_out = self.adaln(adaln_input)
-            shift1, scale1, shift2, scale2 = adaln_out.chunk(4, dim=-1)
-            
-            x_normed = self.attention_norm1(hidden_states) * (1 + scale1.unsqueeze(1)) + shift1.unsqueeze(1)
-            hidden_states = hidden_states + self.attention(x_normed, attention_mask=attn_mask, freqs_cis=freqs_cis)
-            
-            x_ffn = self.ffn_norm1(hidden_states) * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
-            hidden_states = hidden_states + self.ffn_norm2(self.feed_forward(x_ffn))
-        else:
-            hidden_states = hidden_states + self.attention(
-                self.attention_norm1(hidden_states), attention_mask=attn_mask, freqs_cis=freqs_cis
-            )
-            hidden_states = hidden_states + self.ffn_norm2(
-                self.feed_forward(self.ffn_norm1(hidden_states))
-            )
+        hidden_states = super().forward(hidden_states, attn_mask, freqs_cis, adaln_input)
         
         # Inject hint if this block has a corresponding control block
         if self.block_id is not None and hints is not None:
