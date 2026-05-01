@@ -8,7 +8,7 @@ def parse_args() -> argparse.Namespace:
     script_path = Path(__file__).resolve()
     workspace_root = script_path.parents[3]
     default_videox_root = workspace_root / "VideoX-Fun"
-    default_ov_model_dir = workspace_root / "Z-Image-Turbo-ov-int4-gs64-20251205"
+    default_ov_model_dir = workspace_root / "Z-Image-Turbo-ov-int4-gs64-control"
 
     parser = argparse.ArgumentParser(
         description="Export OV-friendly ZImage Control Transformer to OpenVINO IR."

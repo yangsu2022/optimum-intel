@@ -3698,6 +3698,68 @@ def _zimage_patchify_and_embed(
     )
 
 
+def _zimage_patchify(
+    self,
+    all_image,
+    patch_size: int,
+    f_patch_size: int,
+    cap_seq_len: int,
+):
+    """Control-path patchify used by ZImage control forward."""
+    pH = pW = patch_size
+    pF = f_patch_size
+
+    all_image_out = []
+    all_image_size = []
+    all_image_pos_ids = []
+    all_image_pad_mask = []
+
+    for image in all_image:
+        C, F, H, W = image.size()
+        all_image_size.append((F, H, W))
+        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+
+        image = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
+        image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(F_tokens * H_tokens * W_tokens, pF * pH * pW * C)
+
+        image_ori_len = image.size(0)
+        image_padding_len = (-image_ori_len) % 32
+
+        image_ori_pos_ids = self.create_coordinate_grid(
+            size=(F_tokens, H_tokens, W_tokens),
+            start=(cap_seq_len + 1, 0, 0),
+            device=image.device,
+        ).flatten(0, 2)
+        image_padding_pos_ids = (
+            self.create_coordinate_grid(
+                size=(1, 1, 1),
+                start=(0, 0, 0),
+                device=image.device,
+            )
+            .flatten(0, 2)
+            .repeat(image_padding_len, 1)
+        )
+
+        all_image_pos_ids.append(torch.cat([image_ori_pos_ids, image_padding_pos_ids], dim=0))
+        all_image_pad_mask.append(
+            torch.cat(
+                [
+                    torch.zeros((image_ori_len,), dtype=torch.bool, device=image.device),
+                    torch.ones((image_padding_len,), dtype=torch.bool, device=image.device),
+                ],
+                dim=0,
+            )
+        )
+        all_image_out.append(torch.cat([image, image[-1:].repeat(image_padding_len, 1)], dim=0))
+
+    return (
+        all_image_out,
+        all_image_size,
+        all_image_pos_ids,
+        all_image_pad_mask,
+    )
+
+
 class ZImageTransformerModelPatcher(ModelPatcher):
     def __enter__(self):
         super().__enter__()
@@ -3808,11 +3870,8 @@ def _zimage_control_forward(
     cap_feats = list(torch.unbind(encoder_hidden_states, dim=0))
     control_ctx = list(torch.unbind(control_context, dim=0))
     
-    # Handle scalar control_context_scale
-    if control_context_scale.numel() == 1:
-        ctx_scale = control_context_scale.item()
-    else:
-        ctx_scale = control_context_scale[0].item()
+    # Keep scalar as tensor to avoid Python-constant tracing.
+    ctx_scale = control_context_scale.reshape(-1)[0]
     
     # Use default patch sizes
     patch_size = 2
@@ -4072,8 +4131,10 @@ class ZImageControlTransformerModelPatcher(ModelPatcher):
         # Patch forward and patchify_and_embed
         self._orig_forward = self._model.forward
         self._orig_patchify_and_embed = self._model.patchify_and_embed
+        self._orig_patchify = getattr(self._model, "patchify", None)
         self._model.forward = types.MethodType(_zimage_control_forward, self._model)
         self._model.patchify_and_embed = types.MethodType(_zimage_patchify_and_embed, self._model)
+        self._model.patchify = types.MethodType(_zimage_patchify, self._model)
 
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
@@ -4085,6 +4146,11 @@ class ZImageControlTransformerModelPatcher(ModelPatcher):
         self._model.rope_embedder = self._orig_rope_embedder
         self._model.forward = self._orig_forward
         self._model.patchify_and_embed = self._orig_patchify_and_embed
+        if self._orig_patchify is None:
+            if hasattr(self._model, "patchify"):
+                delattr(self._model, "patchify")
+        else:
+            self._model.patchify = self._orig_patchify
         
         # Restore attention processors
         for layer in self._model.noise_refiner:
