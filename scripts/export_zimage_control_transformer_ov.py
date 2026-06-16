@@ -1,81 +1,36 @@
+"""Export VideoX-Fun Z-Image control transformer (hints subgraph) to OpenVINO IR.
+
+Uses ZImageControlTransformerModelPatcher for OV-friendly graph structure,
+TorchScriptPythonDecoder for proper conversion, and fixed partial shapes
+for GPU f16 compatibility.
+"""
+import warnings
+warnings.filterwarnings("ignore", message=".*torch.cuda.amp.autocast.*")
+
 import argparse
-import json
+import gc
 import sys
 from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    script_path = Path(__file__).resolve()
-    workspace_root = script_path.parents[3]
-    default_videox_root = workspace_root / "VideoX-Fun"
-    default_ov_model_dir = workspace_root / "Z-Image-Turbo-ov-int4-gs64-control"
-
-    parser = argparse.ArgumentParser(
-        description="Export OV-friendly ZImage Control Transformer to OpenVINO IR."
-    )
-    parser.add_argument(
-        "--base-model-dir",
-        type=Path,
-        default=None,
-        help="Base ZImage PT model directory (e.g., Tongyi-MAI/Z-Image-Turbo). "
-             "If not set, uses --ov-model-dir config + random backbone weights.",
-    )
-    parser.add_argument(
-        "--ov-model-dir",
-        type=Path,
-        default=default_ov_model_dir,
-        help="OV model root containing transformer/config.json.",
-    )
-    parser.add_argument(
-        "--safetensors",
-        type=Path,
-        default=default_videox_root
-        / "models"
-        / "Personalized_Model"
-        / "Z-Image-Turbo-Fun-Controlnet-Union-2.1-lite-2602-8steps.safetensors",
-        help="Control transformer safetensors path.",
-    )
-    parser.add_argument(
-        "--videox-root",
-        type=Path,
-        default=default_videox_root,
-        help="VideoX-Fun repository root (for config yaml).",
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=default_videox_root / "config" / "z_image" / "z_image_control_2.1_lite.yaml",
-        help="VideoX-Fun config yaml for transformer_additional_kwargs.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Output directory where transformer IR is saved."
-    )
-    parser.add_argument(
-        "--export-type",
-        choices=["hints", "full"],
-        default="hints",
-        help="Export only ControlNet hints subgraph (hints) or full transformer (full).",
-    )
-    parser.add_argument(
-        "--compress-to-fp16",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to save IR constants in FP16 to reduce model size.",
-    )
-    parser.add_argument("--height", type=int, default=64, help="Image height for tracing.")
-    parser.add_argument("--width", type=int, default=64, help="Image width for tracing.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for tracing.")
-    parser.add_argument("--text-len", type=int, default=16, help="Text sequence length for tracing.")
-    parser.add_argument("--control-context-scale", type=float, default=0.9, help="Control scale for tracing.")
-    parser.add_argument(
-        "--weight-dtype",
-        choices=["float32", "float16", "bfloat16"],
-        default="float32",
-        help="Torch dtype for model weights.",
-    )
+    parser = argparse.ArgumentParser(description="Export VideoX-Fun Z-Image control transformer to OpenVINO IR.")
+    parser.add_argument("--model-name", type=Path, required=True, help="Base Z-Image PT model directory (e.g. Z-Image-Turbo-hf).")
+    parser.add_argument("--safetensors", type=Path, required=True, help="ControlNet weights safetensors path.")
+    parser.add_argument("--videox-root", type=Path, required=True, help="VideoX-Fun repo root (contains videox_fun/ and config/).")
+    parser.add_argument("--config", type=Path, default=None, help="Model config yaml. Default: <videox-root>/config/z_image/z_image_control_2.1_lite.yaml")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--height", type=int, default=512, help="Image height for tracing (must match target).")
+    parser.add_argument("--width", type=int, default=512, help="Image width for tracing (must match target).")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--text-len", type=int, default=128, help="Cap sequence length (ZIMAGE_CAP_SEQ=128).")
+    parser.add_argument("--control-context-scale", type=float, default=0.9)
+    parser.add_argument("--weight-dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    parser.add_argument("--enable-int4-compression", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--int4-mode", default="int4_asym")
+    parser.add_argument("--int4-group-size", type=int, default=64)
+    parser.add_argument("--int4-ratio", type=float, default=1.0)
+    parser.add_argument("--compress-to-fp16", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -84,114 +39,69 @@ def _resolve_torch_dtype(dtype_name: str):
     return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
 
 
-def _validate_paths(args: argparse.Namespace):
-    required = [args.safetensors, args.config]
-    if args.base_model_dir:
-        required.append(args.base_model_dir)
-    else:
-        required.append(args.ov_model_dir / "transformer" / "config.json")
-    
-    missing = [str(p) for p in required if not p.exists()]
-    if missing:
-        raise FileNotFoundError("Missing:\n" + "\n".join(missing))
-
-
 def main():
     args = parse_args()
-    _validate_paths(args)
 
-    # Prefer local optimum-intel sources over site-packages.
     script_path = Path(__file__).resolve()
     optimum_intel_root = script_path.parents[1]
     sys.path.insert(0, str(optimum_intel_root))
-    # Remove already-loaded site-packages optimum modules so imports resolve to local tree.
     for name in list(sys.modules):
         if name == "optimum" or name.startswith("optimum."):
             del sys.modules[name]
 
-    import gc
-    import os
+    if args.config is None:
+        args.config = args.videox_root / "config" / "z_image" / "z_image_control_2.1_lite.yaml"
+
+    project_roots = [args.videox_root, args.videox_root.parent]
+    for root in project_roots:
+        root_str = str(root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+
     import openvino as ov
     import torch
     from omegaconf import OmegaConf
     from safetensors.torch import load_file
+    from openvino.frontend.pytorch.ts_decoder import TorchScriptPythonDecoder
 
     from optimum.exporters.openvino.model_patcher import ZImageControlTransformerModelPatcher
-    from optimum.exporters.openvino.z_image_control_model import OVZImageControlTransformer2DModel
-
-    try:
-        import psutil
-        _proc = psutil.Process(os.getpid())
-        def _mem(tag: str) -> None:
-            print(f"[mem] {tag}: RSS={_proc.memory_info().rss / 1024 ** 3:.2f} GB")
-    except ImportError:
-        def _mem(tag: str) -> None:
-            pass
-
-    _mem("startup")
 
     torch_dtype = _resolve_torch_dtype(args.weight_dtype)
 
-    # Load control config from VideoX-Fun
     cfg = OmegaConf.load(str(args.config))
-    control_kwargs = OmegaConf.to_container(cfg.get("transformer_additional_kwargs", {}))
+    control_kwargs = OmegaConf.to_container(cfg["transformer_additional_kwargs"])
 
-    # Build base transformer config
-    cfg_path = args.ov_model_dir / "transformer" / "config.json"
-    with cfg_path.open("r", encoding="utf-8") as f:
-        base_cfg = json.load(f)
-    
-    # Remove private keys and merge with control kwargs
-    base_cfg = {k: v for k, v in base_cfg.items() if not k.startswith("_")}
-    merged_cfg = {**base_cfg, **control_kwargs}
-    
-    print("Building OVZImageControlTransformer2DModel...")
-    transformer = OVZImageControlTransformer2DModel(**merged_cfg)
-    
-    if torch_dtype != torch.float32:
-        transformer = transformer.to(torch_dtype)
-    _mem("after build model")
+    # Build control transformer
+    from videox_fun.models import ZImageControlTransformer2DModel
+
+    print(f"Loading from pretrained: {args.model_name}")
+    transformer = ZImageControlTransformer2DModel.from_pretrained(
+        str(args.model_name), subfolder="transformer",
+        low_cpu_mem_usage=True, torch_dtype=torch_dtype,
+        transformer_additional_kwargs=control_kwargs,
+    )
 
     # Load control weights
-    print(f"Loading control weights from {args.safetensors}...")
     state_dict = load_file(str(args.safetensors))
     state_dict = state_dict.get("state_dict", state_dict)
     missing, unexpected = transformer.load_state_dict(state_dict, strict=False)
     print(f"Loaded control weights. missing={len(missing)} unexpected={len(unexpected)}")
-    del state_dict
-    gc.collect()
-    _mem("after load weights")
 
-    # If base model provided, load backbone weights
-    if args.base_model_dir:
-        print(f"Loading base model weights from {args.base_model_dir}...")
-        from diffusers import ZImageTransformer2DModel
-        base_model = ZImageTransformer2DModel.from_pretrained(
-            str(args.base_model_dir),
-            subfolder="transformer",
-            torch_dtype=torch_dtype,
-        )
-        # Copy base weights (won't overwrite control weights)
-        base_state = base_model.state_dict()
-        transformer.load_state_dict(base_state, strict=False)
-        del base_model, base_state
-        gc.collect()
-        _mem("after load base weights")
+    transformer = transformer.to(torch_dtype).eval()
 
-    transformer = transformer.eval()
+    # Set hints-only mode
+    transformer._ov_hints_only = True
 
-    # Prepare example inputs
     vae_scale_factor = 8
     latent_h = args.height // vae_scale_factor
     latent_w = args.width // vae_scale_factor
-    in_channels = transformer.in_channels
-    control_in_dim = transformer.control_in_dim  # Use control_in_dim for control_context
-    cap_feat_dim = transformer.cap_embedder[1].in_features
+    cap_feat_dim = int(transformer.cap_embedder[1].in_features)
+    in_channels = int(transformer.in_channels)
+    control_in_dim = int(transformer.control_in_dim)
 
     hidden_states = torch.randn(args.batch_size, in_channels, 1, latent_h, latent_w, dtype=torch_dtype)
     timestep = torch.rand(args.batch_size, dtype=torch.float32)
     encoder_hidden_states = torch.randn(args.batch_size, args.text_len, cap_feat_dim, dtype=torch_dtype)
-    # control_context uses control_in_dim (33 = 16 + mask + inpaint channels)
     control_context = torch.randn(args.batch_size, control_in_dim, 1, latent_h, latent_w, dtype=torch_dtype)
     control_context_scale = torch.tensor([args.control_context_scale], dtype=torch.float32)
 
@@ -203,47 +113,85 @@ def main():
         "control_context_scale": control_context_scale,
     }
 
+    input_info = [
+        (list(hidden_states.shape), ov.Type.f32),
+        (list(timestep.shape), ov.Type.f32),
+        (list(encoder_hidden_states.shape), ov.Type.f32),
+        (list(control_context.shape), ov.Type.f32),
+        (list(control_context_scale.shape), ov.Type.f32),
+    ]
+    input_names = ["hidden_states", "timestep", "encoder_hidden_states", "control_context", "control_context_scale"]
+
     class _DummyOnnxConfig:
         PATCHING_SPECS = []
-        outputs = {"hints": {0: "num_hints"}} if args.export_type == "hints" else {"unified_results": {0: "batch"}}
+        outputs = {"hints": {0: "num_hints"}}
         torch_to_onnx_output_map = {}
         use_past = False
 
-    transformer._ov_hints_only = args.export_type == "hints"
-
-    print("Converting to OpenVINO...")
+    print("Applying ZImageControlTransformerModelPatcher and converting...")
     with ZImageControlTransformerModelPatcher(_DummyOnnxConfig(), transformer):
         with torch.no_grad():
-            # Use trace with check_trace=False to handle random backbone weights.
-            traced = torch.jit.trace(
+            ts_decoder = TorchScriptPythonDecoder(
                 transformer,
-                example_kwarg_inputs=example_input,
-                check_trace=False,
-                strict=False,
+                example_input=example_input,
+                trace_kwargs={"check_trace": False},
             )
-    _mem("after torch.jit.trace")
+            ov_model = ov.convert_model(
+                ts_decoder,
+                example_input=example_input,
+                input=input_info,
+            )
+    print("Conversion done.")
 
-    print("Converting traced module to OpenVINO IR...")
-    ov_model = ov.convert_model(traced)
-    _mem("after ov.convert_model")
+    # Set input names
+    for idx, inp_tensor in enumerate(ov_model.inputs):
+        if idx < len(input_names):
+            inp_tensor.get_tensor().set_names({input_names[idx]})
 
-    # Save outputs
-    output_subdir = "transformer_hints" if args.export_type == "hints" else "transformer"
-    output_dir = args.output_dir / output_subdir
+    # Fix partial shapes for GPU f16 compatibility
+    partial_shapes = {
+        "hidden_states": ov.PartialShape([-1, in_channels, -1, -1, -1]),
+        "encoder_hidden_states": ov.PartialShape([-1, -1, cap_feat_dim]),
+        "control_context": ov.PartialShape([-1, control_in_dim, -1, -1, -1]),
+        "control_context_scale": ov.PartialShape([-1]),
+        "timestep": ov.PartialShape([-1]),
+    }
+    reshape_map = {}
+    for inp in ov_model.inputs:
+        name = inp.get_any_name()
+        if name in partial_shapes:
+            reshape_map[inp] = partial_shapes[name]
+    if reshape_map:
+        print("Reshaping for GPU f16:")
+        for inp, ps in reshape_map.items():
+            print(f"  {inp.get_any_name()}: {inp.get_partial_shape()} -> {ps}")
+        ov_model.reshape(reshape_map)
+
+    # Save
+    output_dir = args.output_dir / "transformer_hints"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    transformer.save_config(str(output_dir))
-    
-    del traced, transformer
+    del ts_decoder
     gc.collect()
-    _mem("after free torch module")
+
+    if args.enable_int4_compression:
+        import nncf
+        print(f"Applying NNCF int4 (mode={args.int4_mode}, gs={args.int4_group_size}, ratio={args.int4_ratio})...")
+        ov_model = nncf.compress_weights(
+            ov_model,
+            mode=nncf.CompressWeightsMode(args.int4_mode),
+            group_size=args.int4_group_size,
+            ratio=args.int4_ratio,
+            advanced_parameters=nncf.AdvancedCompressionParameters(
+                group_size_fallback_mode=nncf.GroupSizeFallbackMode.ADJUST
+            ),
+        )
 
     xml_path = output_dir / "openvino_model.xml"
-    ov.save_model(ov_model, str(xml_path), compress_to_fp16=args.compress_to_fp16)
-    _mem("after save_model")
+    save_fp16 = args.compress_to_fp16 and not args.enable_int4_compression
+    ov.save_model(ov_model, str(xml_path), compress_to_fp16=save_fp16)
 
-    # Print IR info
-    print(f"\nSaved transformer IR: {xml_path}")
+    print(f"\nSaved: {xml_path}")
     print("Inputs:")
     for inp in ov_model.inputs:
         print(f"  {inp.get_any_name()}: {inp.get_partial_shape()}")
@@ -258,4 +206,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

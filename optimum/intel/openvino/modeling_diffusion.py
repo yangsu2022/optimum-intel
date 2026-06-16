@@ -1341,10 +1341,17 @@ class OVModelTransformer(OVPipelinePart):
                 model_inputs["block_controlnet_hidden_states"] = block_controlnet_hidden_states
             elif "hints" in input_names:
                 model_inputs["hints"] = block_controlnet_hidden_states
-        elif "hints" in input_names:
+            elif "hint_0" in input_names:
+                # Patched IR with per-layer hint inputs: split [N, B, S, D] into N individual [B, S, D]
+                hints_tensor = block_controlnet_hidden_states
+                if isinstance(hints_tensor, torch.Tensor):
+                    for idx in range(hints_tensor.shape[0]):
+                        key = f"hint_{idx}"
+                        if key in input_names:
+                            model_inputs[key] = hints_tensor[idx]
+        elif "hints" in input_names or "hint_0" in input_names:
             # Compatibility path for base generation with a transformer IR that requires hints.
-            # Build zero hints with shape [3, B, S, D], where S matches unified token length
-            # (image tokens + text tokens) used by the transformer blocks.
+            # Build zero hints with shape [3, B, S, D] or per-layer [B, S, D].
             hs_name = "hidden_states.1" if "hidden_states.1" in model_inputs else "hidden_states"
             hs = model_inputs.get(hs_name)
             if isinstance(hs, torch.Tensor) and hs.ndim == 5:
@@ -1357,12 +1364,18 @@ class OVModelTransformer(OVPipelinePart):
                 seq_len = image_seq_len + text_seq_len
                 hidden_dim = 3840
                 if isinstance(eh, torch.Tensor) and eh.ndim == 3:
-                    # Z-Image usually uses 2560 text dim and 3840 transformer dim.
-                    # Keep 3840 as default but avoid accidental zero/invalid shapes.
                     hidden_dim = max(3840, int(eh.shape[-1]))
-                model_inputs["hints"] = torch.zeros(
-                    (3, bsz, seq_len, hidden_dim), dtype=hs.dtype, device=hs.device
-                )
+                if "hints" in input_names:
+                    model_inputs["hints"] = torch.zeros(
+                        (3, bsz, seq_len, hidden_dim), dtype=hs.dtype, device=hs.device
+                    )
+                elif "hint_0" in input_names:
+                    for idx in range(3):
+                        key = f"hint_{idx}"
+                        if key in input_names:
+                            model_inputs[key] = torch.zeros(
+                                (bsz, seq_len, hidden_dim), dtype=hs.dtype, device=hs.device
+                            )
                 auto_zero_hints = True
 
         if control_context is not None and "control_context" in input_names:

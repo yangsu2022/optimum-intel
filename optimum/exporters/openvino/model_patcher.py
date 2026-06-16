@@ -3500,6 +3500,114 @@ def _zimage_forward(
     return x[0]  # Return single tensor instead of (x, {})
 
 
+def _zimage_forward_with_hints(
+    self,
+    hidden_states,
+    timestep,
+    encoder_hidden_states,
+    hints,
+    control_context_scale,
+) -> torch.Tensor:
+    """Same as _zimage_forward but with hints injection at control_layers_places."""
+    x = list(torch.unbind(hidden_states, dim=0))
+    t = timestep
+    cap_feats = list(torch.unbind(encoder_hidden_states, dim=0))
+
+    patch_size = 2
+    f_patch_size = 1
+
+    assert patch_size in self.all_patch_size
+    assert f_patch_size in self.all_f_patch_size
+
+    bsz = len(x)
+    device = x[0].device
+    t = t * self.t_scale
+    t = self.t_embedder(t)
+
+    (
+        x,
+        cap_feats,
+        x_size,
+        x_pos_ids,
+        cap_pos_ids,
+        x_inner_pad_mask,
+        cap_inner_pad_mask,
+    ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+
+    x_item_seqlens = [_.shape[0] for _ in x]
+    assert all(_ % 32 == 0 for _ in x_item_seqlens)
+    x_max_item_seqlen = max(x_item_seqlens)
+
+    x = torch.cat(x, dim=0)
+    x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+
+    adaln_input = t.type_as(x)
+    x_flat_mask = torch.cat(x_inner_pad_mask)
+    x = torch.where(x_flat_mask.unsqueeze(-1), self.x_pad_token, x)
+    x = list(x.split(x_item_seqlens, dim=0))
+    x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split(x_item_seqlens, dim=0))
+
+    x = pad_sequence(x, batch_first=True, padding_value=0.0)
+    x_freqs_cis = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
+    x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(x_item_seqlens):
+        x_attn_mask[i, :seq_len] = 1
+
+    for layer in self.noise_refiner:
+        x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+
+    cap_item_seqlens = [_.shape[0] for _ in cap_feats]
+    assert all(_ % 32 == 0 for _ in cap_item_seqlens)
+    cap_max_item_seqlen = max(cap_item_seqlens)
+
+    cap_feats = torch.cat(cap_feats, dim=0)
+    cap_feats = self.cap_embedder(cap_feats)
+    cap_flat_mask = torch.cat(cap_inner_pad_mask)
+    cap_feats = torch.where(cap_flat_mask.unsqueeze(-1), self.cap_pad_token, cap_feats)
+    cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+    cap_freqs_cis = list(self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split(cap_item_seqlens, dim=0))
+
+    cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
+    cap_freqs_cis = pad_sequence(cap_freqs_cis, batch_first=True, padding_value=0.0)
+    cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(cap_item_seqlens):
+        cap_attn_mask[i, :seq_len] = 1
+
+    for layer in self.context_refiner:
+        cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
+
+    unified = []
+    unified_freqs_cis = []
+    for i in range(bsz):
+        x_len = x_item_seqlens[i]
+        cap_len = cap_item_seqlens[i]
+        unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
+        unified_freqs_cis.append(torch.cat([x_freqs_cis[i][:x_len], cap_freqs_cis[i][:cap_len]]))
+    unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
+    assert unified_item_seqlens == [len(_) for _ in unified]
+    unified_max_item_seqlen = max(unified_item_seqlens)
+
+    unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+    unified_freqs_cis = pad_sequence(unified_freqs_cis, batch_first=True, padding_value=0.0)
+    unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(unified_item_seqlens):
+        unified_attn_mask[i, :seq_len] = 1
+
+    control_layers_mapping = getattr(self, '_ov_control_layers_mapping', {})
+    ctx_scale = control_context_scale.reshape(())
+
+    for layer_idx, layer in enumerate(self.layers):
+        unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
+        if layer_idx in control_layers_mapping:
+            unified = unified + hints[control_layers_mapping[layer_idx]] * ctx_scale
+
+    unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
+    unified = list(unified.unbind(dim=0))
+    x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
+
+    return x[0]
+
+
 def _zimage_rope_embedder_precompute_freqs_cis(dim: List[int], end: List[int], theta: float = 256.0):
     with torch.device("cpu"):
         freqs_cis = []
@@ -3870,7 +3978,6 @@ def _zimage_control_forward(
     cap_feats = list(torch.unbind(encoder_hidden_states, dim=0))
     control_ctx = list(torch.unbind(control_context, dim=0))
     
-    # Keep scalar as tensor to avoid Python-constant tracing.
     ctx_scale = control_context_scale.reshape(-1)[0]
     
     # Use default patch sizes
@@ -3944,32 +4051,28 @@ def _zimage_control_forward(
         ctrl_attn_mask[i, :seq_len] = 1
 
     # Process control noise refiner to get refiner hints
+    # NOTE: Real model's forward_control_2_0_refiner does new_kwargs.update(kwargs) where kwargs
+    # comes from the x-path (x_attn_mask, x_freqs_cis). This OVERRIDES the control-path masks.
+    # So refiner blocks use x_attn_mask/x_freqs_cis, not ctrl_attn_mask/ctrl_freqs_cis.
     refiner_hints = None
     control_context_for_layers = ctrl_ctx
     control_context_item_seqlens = ctrl_item_seqlens
     if hasattr(self, 'add_control_noise_refiner') and self.add_control_noise_refiner:
-        # Match VideoX-Fun's 2.0 flow: select refiner layers based on
-        # add_control_noise_refiner_correctly.
         local_layers = self.control_noise_refiner if self.add_control_noise_refiner_correctly else self.control_layers
         c = ctrl_ctx
-        for idx, layer in enumerate(local_layers):
-            if idx == 0:
-                refiner_hints, c = layer(c, x, ctrl_attn_mask, ctrl_freqs_cis, adaln_input, None)
-            else:
-                refiner_hints, c = layer(c, x, ctrl_attn_mask, ctrl_freqs_cis, adaln_input, refiner_hints)
-        control_context_for_layers = c
+        for layer in local_layers:
+            c = layer(c, x, x_attn_mask, x_freqs_cis, adaln_input)
+        refiner_hints = torch.unbind(c)[:-1]
+        control_context_for_layers = torch.unbind(c)[-1]
     else:
-        # Match VideoX-Fun's 1.0 flow: run control_noise_refiner on
-        # control context before control_layers.
         c = ctrl_ctx
         for layer in self.control_noise_refiner:
             c = layer(c, ctrl_attn_mask, ctrl_freqs_cis, adaln_input)
         control_context_for_layers = c
-    
-    # Noise refiner with optional hint injection
+
     for layer in self.noise_refiner:
-        if refiner_hints is not None and hasattr(layer, 'block_id') and layer.block_id is not None:
-            x = layer(x, x_attn_mask, x_freqs_cis, adaln_input, refiner_hints, ctx_scale)
+        if refiner_hints is not None:
+            x = layer(x, refiner_hints, ctx_scale, x_attn_mask, x_freqs_cis, adaln_input)
         else:
             x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
 
@@ -4020,13 +4123,10 @@ def _zimage_control_forward(
     ctrl_unified = pad_sequence(ctrl_unified, batch_first=True, padding_value=0.0)
 
     # Process control layers to get hints
-    hints = None
     c = ctrl_unified
-    for idx, layer in enumerate(self.control_layers):
-        if idx == 0:
-            hints, c = layer(c, unified, unified_attn_mask, unified_freqs_cis, adaln_input, None)
-        else:
-            hints, c = layer(c, unified, unified_attn_mask, unified_freqs_cis, adaln_input, hints)
+    for layer in self.control_layers:
+        c = layer(c, unified, unified_attn_mask, unified_freqs_cis, adaln_input)
+    hints = torch.stack(list(torch.unbind(c)[:-1]))
 
     # Hints-only export: stop here to avoid baking full main-transformer constants.
     if getattr(self, "_ov_hints_only", False):
@@ -4035,7 +4135,7 @@ def _zimage_control_forward(
     # Main transformer layers with hint injection
     for layer in self.layers:
         if hints is not None and hasattr(layer, 'block_id') and layer.block_id is not None:
-            unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input, hints, ctx_scale)
+            unified = layer(unified, hints, ctx_scale, unified_attn_mask, unified_freqs_cis, adaln_input)
         else:
             unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
 
@@ -4128,6 +4228,66 @@ class ZImageControlTransformerModelPatcher(ModelPatcher):
                     layer.attention._orig_processor = layer.attention.processor
                     layer.attention.processor = PatchedZSingleStreamAttnProcessor()
 
+        # Patch block forward methods to accept positional args for trace compatibility.
+        # ZImageControlTransformerBlock.forward(c, x, attn_mask, freqs_cis, adaln_input, all_c) -> (hints, c)
+        # BaseZImageTransformerBlock.forward(hidden_states, hints, ctx_scale, attn_mask, freqs_cis, adaln_input)
+        from diffusers.models.transformers.transformer_z_image import ZImageTransformerBlock as _DiffusersBlock
+
+        def _patched_control_block_forward(self_layer, c, x, attn_mask, freqs_cis, adaln_input):
+            """Positional-arg wrapper for ZImageControlTransformerBlock.
+            Returns single stacked tensor, exactly like the real model."""
+            if self_layer.block_id == 0:
+                c = self_layer.before_proj(c) + x
+                all_c_list = []
+            else:
+                all_c_list = list(torch.unbind(c))
+                c = all_c_list.pop(-1)
+            c = _DiffusersBlock.forward(self_layer, c, attn_mask, freqs_cis, adaln_input)
+            c_skip = self_layer.after_proj(c)
+            all_c_list += [c_skip, c]
+            return torch.stack(all_c_list)
+
+        def _patched_base_block_forward(self_layer, hidden_states, *args):
+            """Positional-arg wrapper for BaseZImageTransformerBlock.
+            Called as: layer(x, attn_mask, freqs_cis, adaln_input) — 4 args, no hints
+            Or: layer(x, hints, ctx_scale, attn_mask, freqs_cis, adaln_input) — 6 args with hints
+            """
+            if len(args) == 3:
+                # (hidden_states, attn_mask, freqs_cis, adaln_input)
+                attn_mask, freqs_cis, adaln_input = args
+                hidden_states = _DiffusersBlock.forward(self_layer, hidden_states, attn_mask, freqs_cis, adaln_input)
+            elif len(args) == 5:
+                # (hidden_states, hints, ctx_scale, attn_mask, freqs_cis, adaln_input)
+                hints, ctx_scale, attn_mask, freqs_cis, adaln_input = args
+                hidden_states = _DiffusersBlock.forward(self_layer, hidden_states, attn_mask, freqs_cis, adaln_input)
+                if self_layer.block_id is not None and hints is not None:
+                    hidden_states = hidden_states + hints[self_layer.block_id] * ctx_scale
+            return hidden_states
+
+        # Patch control_noise_refiner (ZImageControlTransformerBlock)
+        if hasattr(self._model, 'control_noise_refiner'):
+            for layer in self._model.control_noise_refiner:
+                layer._orig_forward = layer.forward
+                layer.forward = types.MethodType(_patched_control_block_forward, layer)
+
+        # Patch control_layers (ZImageControlTransformerBlock)
+        if hasattr(self._model, 'control_layers'):
+            for layer in self._model.control_layers:
+                layer._orig_forward = layer.forward
+                layer.forward = types.MethodType(_patched_control_block_forward, layer)
+
+        # Patch noise_refiner (BaseZImageTransformerBlock)
+        for layer in self._model.noise_refiner:
+            if hasattr(layer, 'block_id'):
+                layer._orig_forward = layer.forward
+                layer.forward = types.MethodType(_patched_base_block_forward, layer)
+
+        # Patch main layers (BaseZImageTransformerBlock)
+        for layer in self._model.layers:
+            if hasattr(layer, 'block_id'):
+                layer._orig_forward = layer.forward
+                layer.forward = types.MethodType(_patched_base_block_forward, layer)
+
         # Patch forward and patchify_and_embed
         self._orig_forward = self._model.forward
         self._orig_patchify_and_embed = self._model.patchify_and_embed
@@ -4174,6 +4334,20 @@ class ZImageControlTransformerModelPatcher(ModelPatcher):
             for layer in self._model.control_noise_refiner:
                 if hasattr(layer, 'attention') and hasattr(layer.attention, '_orig_processor'):
                     layer.attention.processor = layer.attention._orig_processor
+
+        # Restore patched block forwards
+        for layer_list in [self._model.noise_refiner, self._model.layers]:
+            for layer in layer_list:
+                if hasattr(layer, '_orig_forward'):
+                    layer.forward = layer._orig_forward
+        if hasattr(self._model, 'control_noise_refiner'):
+            for layer in self._model.control_noise_refiner:
+                if hasattr(layer, '_orig_forward'):
+                    layer.forward = layer._orig_forward
+        if hasattr(self._model, 'control_layers'):
+            for layer in self._model.control_layers:
+                if hasattr(layer, '_orig_forward'):
+                    layer.forward = layer._orig_forward
 
 
 def _minicpmv_resampler_forward(self, image_feature, pos_embed, key_padding_mask):
